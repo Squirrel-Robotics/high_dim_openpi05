@@ -84,7 +84,8 @@ class DataConfig:
 
     # Names of keys that will be used by the data loader to generate the action sequence. The length of the
     # sequence is defined by the `action_horizon` field in the model config. This should be adjusted if your
-    # LeRobot dataset is using different keys to represent the action.
+    # LeRobot dataset is using different keys to represent the action. Use () when each dataset row already
+    # contains the full action chunk, so the data loader does not add another time dimension.
     action_sequence_keys: Sequence[str] = ("actions",)
 
     # If true, will use the LeRobot dataset task to define the prompt.
@@ -352,6 +353,49 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotTeleopDataConfig(DataConfigFactory):
+    """Dual-arm teleoperation: state [58], pre-chunked absolute target actions [50, 58].
+
+    Layout: left EEF pose [0:9], right EEF pose [9:18], left hand [18:38], right hand [38:58].
+    Each EEF pose is position (3) followed by Rotation6D (6).
+    """
+
+    # Wired in the next implementation step: image/state adaptation and observation-anchored SE(3)
+    # action conversion before normalization, with the inverse conversion for policy outputs.
+    data_transforms: tyro.conf.Suppress[GroupFactory | None] = None
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        if self.data_transforms is None:
+            raise NotImplementedError(
+                "Teleop 58D data transforms are not implemented yet. "
+                "Connect the teleop input/output transforms before computing statistics or training."
+            )
+
+        repack_transforms = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image": "observation.images.head_rgb",
+                        "observation/left_wrist_image": "observation.images.left_wrist_rgb",
+                        "observation/right_wrist_image": "observation.images.right_wrist_rgb",
+                        "observation/state": "observation.state",
+                        "actions": "action",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transforms,
+            data_transforms=self.data_transforms(model_config),
+            model_transforms=ModelTransformFactory()(model_config),
         )
 
 
@@ -759,6 +803,43 @@ _CONFIGS = [
         ema_decay=0.999,
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        num_train_steps=30_000,
+    ),
+    #
+    # Fine-tuning dual-arm teleoperation with 20-dimensional hands.
+    # This config is being implemented in stages; the teleoperation data adapter still needs to be connected.
+    #
+    TrainConfig(
+        name="pi05_teleop_58d",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=58,
+            action_horizon=50,
+            # Initial budget for the prompt + discretized 58D state; check truncation on real data.
+            max_token_len=256,
+            discrete_state_input=True,
+        ),
+        data=LeRobotTeleopDataConfig(
+            repo_id=tyro.MISSING,  # Set the actual LeRobot repo_id when the dataset is available.
+            assets=AssetsConfig(asset_id="teleop_58d"),
+            base_config=DataConfig(
+                # Each row already contains action [50, 58]; do not stack another 50 rows.
+                action_sequence_keys=(),
+                prompt_from_task=True,
+            ),
+        ),
+        batch_size=64,  # Global batch size across all eight GPUs.
+        fsdp_devices=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        # Retain pretrained weights except the three action projection parameters resized from 32 to 58.
+        weight_loader=weight_loaders.ActionDimCheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=30_000,
     ),
     #
