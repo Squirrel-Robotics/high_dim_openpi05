@@ -55,6 +55,22 @@ class CheckpointWeightLoader(WeightLoader):
 
 
 @dataclasses.dataclass(frozen=True)
+class ActionDimCheckpointWeightLoader(WeightLoader):
+    """Loads pi05 weights while allowing the action dimension to change (e.g. 32 -> 58).
+
+    Only the input projection kernel and output projection kernel/bias may change shape, and only
+    along their action axes. These leaves retain the reference initialization; matching leaves are
+    loaded normally. Missing checkpoint parameters are errors, except for newly added LoRA weights.
+    """
+
+    params_path: str
+
+    def load(self, params: at.Params) -> at.Params:
+        loaded_params = _model.restore_params(download.maybe_download(self.params_path), restore_type=np.ndarray)
+        return _merge_action_dim_params(loaded_params, params)
+
+
+@dataclasses.dataclass(frozen=True)
 class PaliGemmaWeightLoader(WeightLoader):
     """Loads weights from the official PaliGemma checkpoint.
 
@@ -71,6 +87,61 @@ class PaliGemmaWeightLoader(WeightLoader):
         loaded_params = {"PaliGemma": flax.traverse_util.unflatten_dict(flat_params, sep="/")["params"]}
         # Add all missing weights.
         return _merge_params(loaded_params, params, missing_regex=".*")
+
+
+# Exact parameter paths mapped to (expected rank, action axis). In particular, action_in_proj/bias
+# depends on the expert width, not the action dimension, and must always load from the checkpoint.
+_ACTION_DIM_PARAMS = {
+    "action_in_proj/kernel": (2, 0),
+    "action_out_proj/kernel": (2, 1),
+    "action_out_proj/bias": (1, 0),
+}
+
+
+def _merge_action_dim_params(loaded_params: at.Params, params: at.Params) -> at.Params:
+    flat_ref = flax.traverse_util.flatten_dict(params, sep="/")
+    flat_loaded = flax.traverse_util.flatten_dict(loaded_params, sep="/")
+
+    # All three projections must describe the same action dimension within each parameter tree.
+    # This also ensures that a missing projection cannot silently fall back to initialization.
+    for label, flat_params in (("checkpoint", flat_loaded), ("model", flat_ref)):
+        action_dims = {}
+        for key, (rank, axis) in _ACTION_DIM_PARAMS.items():
+            if key not in flat_params:
+                raise ValueError(f"Missing required parameter {key} in {label}")
+            shape = flat_params[key].shape
+            if len(shape) != rank:
+                raise ValueError(f"Invalid rank for {key} in {label}: expected {rank}, got shape {shape}")
+            action_dims[key] = shape[axis]
+        if len(set(action_dims.values())) != 1:
+            raise ValueError(f"Inconsistent action dimensions in {label}: {action_dims}")
+
+    result = {}
+    for key, ref in flat_ref.items():
+        if key not in flat_loaded:
+            if re.fullmatch(".*lora.*", key):
+                result[key] = ref
+                continue
+            raise ValueError(f"Missing required parameter {key} in checkpoint")
+
+        loaded = flat_loaded[key]
+        if loaded.shape == ref.shape:
+            result[key] = loaded.astype(ref.dtype) if loaded.dtype != ref.dtype else loaded
+            continue
+
+        spec = _ACTION_DIM_PARAMS.get(key)
+        if spec is None:
+            raise ValueError(f"Unexpected shape mismatch for {key}: checkpoint {loaded.shape}, model {ref.shape}")
+        _, axis = spec
+        if loaded.shape[:axis] + loaded.shape[axis + 1 :] != ref.shape[:axis] + ref.shape[axis + 1 :]:
+            raise ValueError(f"Non-action dimensions differ for {key}: checkpoint {loaded.shape}, model {ref.shape}")
+
+        # During JAX training ref is a ShapeDtypeStruct. scripts/train.py validates the complete tree,
+        # then removes these placeholders so the model's fresh initialization is kept for these leaves.
+        result[key] = ref
+        logger.info("Re-initializing %s: checkpoint shape %s -> model shape %s", key, loaded.shape, ref.shape)
+
+    return flax.traverse_util.unflatten_dict(result, sep="/")
 
 
 def _merge_params(loaded_params: at.Params, params: at.Params, *, missing_regex: str) -> at.Params:
