@@ -62,6 +62,20 @@ class TransformedDataset(Dataset[T_co]):
         return len(self._dataset)
 
 
+class IndexedDataset(Dataset[T_co]):
+    """Select rows without changing the underlying dataset's episode or video indices."""
+
+    def __init__(self, dataset: Dataset[T_co], indices: np.ndarray):
+        self._dataset = dataset
+        self._indices = indices
+
+    def __getitem__(self, index: SupportsIndex) -> T_co:
+        return self._dataset[int(self._indices[index.__index__()])]
+
+    def __len__(self) -> int:
+        return len(self._indices)
+
+
 class IterableTransformedDataset(IterableDataset[T_co]):
     def __init__(
         self,
@@ -130,25 +144,92 @@ class FakeDataset(Dataset):
 def create_torch_dataset(
     data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
 ) -> Dataset:
-    """Create a dataset for training."""
+    """Create a dataset shared by training and normalization-statistics computation."""
     repo_id = data_config.repo_id
     if repo_id is None:
         raise ValueError("Repo ID is not set. Cannot create dataset.")
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
 
+    if data_config.action_sequence_keys and (
+        data_config.prechunked_action_key is not None or data_config.action_padding_mask_key is not None
+    ):
+        raise ValueError("Stored action chunks and padding masks require action_sequence_keys=().")
+
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
-    dataset = lerobot_dataset.LeRobotDataset(
-        data_config.repo_id,
-        delta_timestamps={
+    if data_config.prechunked_action_key is not None:
+        key = data_config.prechunked_action_key
+        if key not in dataset_meta.features:
+            raise ValueError(f"Pre-chunked action feature {key!r} is missing from dataset metadata.")
+        shape = tuple(dataset_meta.features[key]["shape"])
+        expected = (action_horizon, model_config.action_dim)
+        if shape != expected:
+            raise ValueError(f"Pre-chunked action feature {key!r} has shape {shape}; expected {expected}.")
+
+    delta_timestamps = None
+    if data_config.action_sequence_keys:
+        delta_timestamps = {
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
-        },
+        }
+    dataset = lerobot_dataset.LeRobotDataset(
+        repo_id,
+        delta_timestamps=delta_timestamps,
     )
+    dataset = _filter_lerobot_dataset(dataset, data_config, action_horizon)
 
     if data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
 
     return dataset
+
+
+def _filter_lerobot_dataset(
+    dataset: lerobot_dataset.LeRobotDataset, data_config: _config.DataConfig, action_horizon: int
+) -> Dataset:
+    filters = [(data_config.sample_valid_key, False), (data_config.action_padding_mask_key, True)]
+    keys = list(dict.fromkeys(key for key, _ in filters if key is not None))
+    if not keys:
+        return dataset
+
+    # Read only stored marker columns. Reset LeRobot's custom Torch formatting on this copy, so
+    # scanning does not load observations, invoke __getitem__, or decode videos.
+    hf_dataset = dataset.hf_dataset
+    if len(hf_dataset) != len(dataset):
+        raise ValueError("LeRobot metadata rows do not match dataset length; cannot map filtered indices.")
+    missing = set(keys) - set(hf_dataset.column_names)
+    if missing:
+        raise ValueError(f"Missing sample filter columns: {sorted(missing)}")
+    metadata = hf_dataset.select_columns(keys).with_format(None)
+
+    index_chunks = []
+    offset = 0
+    for batch in metadata.iter(batch_size=4096):
+        batch_size = len(batch[keys[0]])
+        keep = np.ones(batch_size, dtype=bool)
+        for key, is_padding in filters:
+            if key is None:
+                continue
+            values = np.asarray(batch[key])
+            expected_shapes = [(batch_size, action_horizon)] if is_padding else [(batch_size,), (batch_size, 1)]
+            if values.shape not in expected_shapes:
+                raise ValueError(
+                    f"Sample filter {key!r} has shape {values.shape} at row {offset}; expected {expected_shapes}."
+                )
+            if values.dtype.kind not in "biuf" or not np.all((values == 0) | (values == 1)):
+                raise ValueError(f"Sample filter {key!r} must contain only binary 0/1 values (near row {offset}).")
+            if is_padding:
+                keep &= ~values.astype(bool).any(axis=1)
+            else:
+                keep &= values.reshape(batch_size) == 1
+
+        index_chunks.append(np.flatnonzero(keep) + offset)
+        offset += batch_size
+
+    indices = np.concatenate(index_chunks) if index_chunks else np.empty(0, dtype=np.int64)
+    if len(indices) == 0:
+        raise ValueError("No valid samples remain after applying the configured sample filters.")
+    logging.info("Sample filtering retained %d/%d rows using %s", len(indices), len(dataset), keys)
+    return IndexedDataset(dataset, indices)
 
 
 def create_rlds_dataset(
