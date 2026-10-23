@@ -88,6 +88,14 @@ class DataConfig:
     # contains the full action chunk, so the data loader does not add another time dimension.
     action_sequence_keys: Sequence[str] = ("actions",)
 
+    # Optional raw feature containing a complete [action_horizon, action_dim] chunk. When set,
+    # action_sequence_keys must be empty and the stored shape must match the model exactly.
+    prechunked_action_key: str | None = None
+    # Optional stored markers used to filter rows before transforms and normalization statistics.
+    # A valid marker is scalar or [1]; the padding mask has shape [action_horizon].
+    sample_valid_key: str | None = None
+    action_padding_mask_key: str | None = None
+
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
 
@@ -825,6 +833,9 @@ _CONFIGS = [
             base_config=DataConfig(
                 # Each row already contains action [50, 58]; do not stack another 50 rows.
                 action_sequence_keys=(),
+                prechunked_action_key="action",
+                sample_valid_key="sample_valid_h50",
+                action_padding_mask_key="action_is_pad",
                 prompt_from_task=True,
             ),
         ),
