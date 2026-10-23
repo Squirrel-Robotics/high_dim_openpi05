@@ -75,3 +75,5 @@ export HF_LEROBOT_HOME=/mnt/data/lerobot
 也可单独传 `--output-root /mnt/data/lerobot`，训练时仍需设置匹配的 `HF_LEROBOT_HOME`。输出包含 Parquet、三路重采样视频、任务/episode/统计元数据和 `meta/prepare_manifest.json`；manifest 记录来源、维度约定、时间阈值与有效样本数。
 
 该步骤只准备数据。当前 `LeRobotTeleopDataConfig` 的 policy adapter 仍待接入，因此暂不能直接开始训练。接入 adapter 后再计算 OpenPI 的归一化统计；此处 LeRobot 元数据中的统计不能代替它。单条 episode 仅用于检查流程，训练前需汇总更多 episode 并按 episode 划分训练/验证集。
+
+转换完成后，使用 [数据校验与离线评估](../umi/README.md) 中的 `validate_dataset.py` 检查数据；训练后使用 `evaluate.py` 评估 checkpoint，也可以先评估已保存的物理量预测。
